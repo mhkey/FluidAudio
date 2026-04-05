@@ -846,11 +846,32 @@ public struct PocketTtsSynthesizer {
             } else {
                 if !currentPart.isEmpty {
                     result.append(currentPart)
-                }
-                // If single clause part still exceeds limit, split at word boundaries
-                if tokenizer.encode(part).count > maxTokens {
-                    result.append(contentsOf: splitAtWordBoundaries(part, tokenizer: tokenizer, maxTokens: maxTokens))
                     currentPart = ""
+                }
+                // If single clause part still exceeds limit, try conjunctions
+                // and natural phrase boundaries before falling back to word splits
+                if tokenizer.encode(part).count > maxTokens {
+                    let conjParts = splitAtConjunctions(part)
+                    if conjParts.count > 1 {
+                        // Recurse: group conjunction parts respecting token limit
+                        for cp in conjParts {
+                            let cpCandidate = currentPart.isEmpty ? cp : currentPart + " " + cp
+                            if tokenizer.encode(cpCandidate).count <= maxTokens {
+                                currentPart = cpCandidate
+                            } else {
+                                if !currentPart.isEmpty { result.append(currentPart); currentPart = "" }
+                                if tokenizer.encode(cp).count > maxTokens {
+                                    result.append(contentsOf: splitAtWordBoundaries(cp, tokenizer: tokenizer, maxTokens: maxTokens))
+                                    currentPart = ""
+                                } else {
+                                    currentPart = cp
+                                }
+                            }
+                        }
+                    } else {
+                        result.append(contentsOf: splitAtWordBoundaries(part, tokenizer: tokenizer, maxTokens: maxTokens))
+                        currentPart = ""
+                    }
                 } else {
                     currentPart = part
                 }
@@ -897,6 +918,48 @@ public struct PocketTtsSynthesizer {
         let trimmed = current.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty {
             parts.append(trimmed)
+        }
+
+        return parts
+    }
+
+    /// Words that mark natural prosodic boundaries in speech.
+    ///
+    /// Splits happen **before** these words so each chunk ends at a natural pause point.
+    /// Ordered roughly by boundary strength (strongest first).
+    private static let conjunctionBreaks: Set<String> = [
+        // Coordinating conjunctions
+        "and", "but", "or", "nor", "so", "yet",
+        // Subordinating conjunctions
+        "because", "although", "though", "while", "whereas",
+        "since", "unless", "until", "after", "before",
+        "if", "when", "where", "whenever", "wherever",
+        // Relative pronouns (clause starters)
+        "which", "who", "whom", "whose", "that",
+    ]
+
+    /// Split text before conjunctions and natural clause-starting words.
+    ///
+    /// Returns the original text as a single-element array if no conjunctions found.
+    private static func splitAtConjunctions(_ text: String) -> [String] {
+        let words = text.split(separator: " ").map(String.init)
+        guard words.count > 2 else { return [text] }
+
+        var parts: [String] = []
+        var current: [String] = []
+
+        for word in words {
+            // Split before conjunction if we have accumulated words
+            if current.count >= 2 && conjunctionBreaks.contains(word.lowercased()) {
+                parts.append(current.joined(separator: " "))
+                current = [word]
+            } else {
+                current.append(word)
+            }
+        }
+
+        if !current.isEmpty {
+            parts.append(current.joined(separator: " "))
         }
 
         return parts

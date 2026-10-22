@@ -97,11 +97,16 @@ final class PocketTtsStreamingTests: XCTestCase {
         XCTAssertTrue(text.contains("H"), "Should capitalize first letter")
     }
 
-    func testNormalizeTextShortTextPadding() {
-        // Short text (< 5 words) gets padding
-        let (text, frames) = PocketTtsSynthesizer.normalizeText("Hi")
-        XCTAssertTrue(text.hasPrefix(" "), "Short text should be padded")
-        XCTAssertEqual(frames, PocketTtsConstants.shortTextPadFrames)
+    func testNormalizeTextShortTextKeepsTailWithoutLegacySpacePadding() {
+        // The loaded v2 packs disable pad_with_spaces_for_short_inputs.
+        // Leading spaces caused a single "Bye, Boss." to synthesize "Bye bye, Boss."
+        for language in PocketTtsLanguage.allCases {
+            for phrase in ["Hi.", "Bye, Boss.", "Hello, Boss.", "Goodbye, Boss."] {
+                let (text, frames) = PocketTtsSynthesizer.normalizeText(phrase, language: language)
+                XCTAssertEqual(text, phrase, "language=\(language), phrase=\(phrase)")
+                XCTAssertEqual(frames, PocketTtsConstants.shortTextPadFrames)
+            }
+        }
     }
 
     func testNormalizeTextLongTextNoExtraPadding() {
@@ -483,14 +488,11 @@ final class PocketTtsStreamingTests: XCTestCase {
             "Mid-sentence short clause must not use shortTextPadFrames")
     }
 
-    func testNormalizeTextFullSentenceShortChunkStillPads() {
-        // The padding behaviour for legitimate short sentences (the original
-        // prosody-stabilisation case) must remain unchanged.
+    func testNormalizeTextFullSentenceShortChunkKeepsAudioTail() {
+        // Audio tail frames remain independent of text-token padding.
         let (text, frames) = PocketTtsSynthesizer.normalizeText(
             "Hi there", isMidSentence: false, language: .english)
-        XCTAssertTrue(
-            text.hasPrefix(" "),
-            "Full short sentence should still be left-padded; got: '\(text)'")
+        XCTAssertEqual(text, "Hi there.")
         XCTAssertEqual(
             frames, PocketTtsConstants.shortTextPadFrames,
             "Full short sentence should still use shortTextPadFrames")

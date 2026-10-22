@@ -870,15 +870,14 @@ public struct PocketTtsSynthesizer {
             }
         }
 
-        // Pad short texts for better prosody — but only for full sentences.
-        // Mid-sentence chunks (clause/word-boundary continuations) must skip
-        // the leading-space padding and the extra trailing frames; otherwise
-        // each short fragment introduces ~80ms+ of silence at the seam, which
-        // re-creates the prosody break we're trying to remove (issue #584).
+        // v2/v2.1 packs disable upstream's legacy short-input space padding.
+        // Retaining that January-model workaround adds unwanted conditioning
+        // tokens and can make a short reply repeat its opening word.
+        // Keep the short-sentence audio tail; mid-sentence continuations still
+        // skip the extra trailing frames to avoid a pause at the seam (#584).
         let wordCount = result.split(separator: " ").count
         let framesAfterEos: Int
         if !isMidSentence, wordCount < PocketTtsConstants.shortTextWordThreshold {
-            result = String(repeating: " ", count: 8) + result
             framesAfterEos = PocketTtsConstants.shortTextPadFrames
         } else {
             framesAfterEos = PocketTtsConstants.longTextExtraFrames

@@ -1,5 +1,6 @@
 @preconcurrency import CoreML
 import Foundation
+import os
 
 /// A persistent TTS session that keeps the voice KV cache warm across utterances.
 ///
@@ -25,7 +26,20 @@ public actor PocketTtsSession {
     /// internally if it exceeds the per-chunk token limit. Can be called
     /// multiple times to stream text as it arrives.
     public nonisolated func enqueue(_ text: String) {
-        textContinuation.yield(text)
+        textContinuation.yield(Utterance(id: nil, text: text, frames: nil))
+    }
+
+    /// Enqueue an utterance with its own frame stream. The stream ends immediately
+    /// after this utterance's final chunk, even while the session remains open.
+    /// Frames submitted this way are not duplicated into the session-wide stream.
+    public nonisolated func enqueueStreaming(_ text: String) -> AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error> {
+        let (stream, continuation) = AsyncThrowingStream.makeStream(of: PocketTtsSynthesizer.AudioFrame.self)
+        let id = UUID()
+        pendingUtterances.withLock { $0[id] = continuation }
+        if case .terminated = textContinuation.yield(Utterance(id: id, text: text, frames: continuation)) {
+            pendingUtterances.withLock { $0.removeValue(forKey: id) }?.finish(throwing: CancellationError())
+        }
+        return stream
     }
 
     /// Signal that no more text will be enqueued.
@@ -43,13 +57,34 @@ public actor PocketTtsSession {
     public func cancel() async {
         generationTask?.cancel()
         textContinuation.finish()
+        finishPendingUtterances(throwing: CancellationError())
         await generationTask?.value
     }
 
     // MARK: - Internal State
 
-    private nonisolated let textContinuation: AsyncStream<String>.Continuation
-    private let textStream: AsyncStream<String>
+    struct Utterance: Sendable {
+        let id: UUID?
+        let text: String
+        let frames: AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error>.Continuation?
+    }
+
+    private nonisolated let textContinuation: AsyncStream<Utterance>.Continuation
+    private let textStream: AsyncStream<Utterance>
+    private var utteranceFrames: AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error>.Continuation?
+    // AsyncStream stops iteration on task cancellation without draining buffered
+    // inputs. Keep their output continuations so cancel/error settles every one.
+    private nonisolated let pendingUtterances = OSAllocatedUnfairLock(
+        initialState: [UUID: AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error>.Continuation]())
+
+    private func finishPendingUtterances(throwing error: Error) {
+        let pending = pendingUtterances.withLock { values in
+            let pending = Array(values.values)
+            values.removeAll()
+            return pending
+        }
+        for continuation in pending { continuation.finish(throwing: error) }
+    }
     private let frameContinuation: AsyncThrowingStream<PocketTtsSynthesizer.AudioFrame, Error>.Continuation
     private var generationTask: Task<Void, Never>?
 
@@ -138,7 +173,7 @@ public actor PocketTtsSession {
         self.stateVoiceData = nil
 
         // Text queue channel
-        let (textStream, textContinuation) = AsyncStream.makeStream(of: String.self)
+        let (textStream, textContinuation) = AsyncStream.makeStream(of: Utterance.self)
         self.textStream = textStream
         self.textContinuation = textContinuation
 
@@ -196,7 +231,7 @@ public actor PocketTtsSession {
         self.stateVoiceData = voiceData
 
         // Text queue channel
-        let (textStream, textContinuation) = AsyncStream.makeStream(of: String.self)
+        let (textStream, textContinuation) = AsyncStream.makeStream(of: Utterance.self)
         self.textStream = textStream
         self.textContinuation = textContinuation
 
@@ -227,10 +262,20 @@ public actor PocketTtsSession {
 
         do {
             for await text in textStream {
-                if Task.isCancelled { break }
-
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { continue }
+                if Task.isCancelled {
+                    text.frames?.finish(throwing: CancellationError())
+                    continue
+                }
+                utteranceFrames = text.frames
+                defer {
+                    if let id = text.id { pendingUtterances.withLock { $0.removeValue(forKey: id) } }
+                }
+                let trimmed = text.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else {
+                    utteranceFrames?.finish()
+                    utteranceFrames = nil
+                    continue
+                }
 
                 let chunks = PocketTtsSynthesizer.chunkTextWithMetadata(
                     trimmed, tokenizer: constants.tokenizer,
@@ -254,10 +299,18 @@ public actor PocketTtsSession {
                         utteranceIndex: utteranceIndex
                     )
                 }
+                if Task.isCancelled { utteranceFrames?.finish(throwing: CancellationError()) }
+                else { utteranceFrames?.finish() }
+                utteranceFrames = nil
                 utteranceIndex += 1
             }
+            if Task.isCancelled { finishPendingUtterances(throwing: CancellationError()) }
             frameContinuation.finish()
         } catch {
+            utteranceFrames?.finish(throwing: error)
+            utteranceFrames = nil
+            textContinuation.finish()
+            finishPendingUtterances(throwing: error)
             frameContinuation.finish(throwing: error)
         }
     }
@@ -361,7 +414,7 @@ public actor PocketTtsSession {
             mimiState = localMimi
 
             // Yield frame
-            frameContinuation.yield(
+            (utteranceFrames ?? frameContinuation).yield(
                 PocketTtsSynthesizer.AudioFrame(
                     samples: frameSamples,
                     frameIndex: step,
@@ -533,7 +586,7 @@ public actor PocketTtsSession {
             mimiState = localMimi
 
             // Yield frame
-            frameContinuation.yield(
+            (utteranceFrames ?? frameContinuation).yield(
                 PocketTtsSynthesizer.AudioFrame(
                     samples: frameSamples,
                     frameIndex: step,

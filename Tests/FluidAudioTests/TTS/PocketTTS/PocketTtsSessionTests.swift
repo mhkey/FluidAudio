@@ -84,4 +84,38 @@ final class PocketTtsSessionTests: XCTestCase {
         }
     }
 
+    /// Real model test, without an audio device. Explicit opt-in keeps ordinary
+    /// CI independent of model downloads and local CoreML hardware.
+    func testPerUtteranceStreamsFinishWhileSessionRemainsOpen() async throws {
+        guard ProcessInfo.processInfo.environment["FLUID_TEST_POCKET_SESSION"] == "1" else {
+            throw XCTSkip("Set FLUID_TEST_POCKET_SESSION=1 to run Pocket model integration")
+        }
+        let manager = PocketTtsManager()
+        try await manager.initialize()
+        let session = try await manager.makeSession(voice: "alba", seed: 42)
+        let first = session.enqueueStreaming("The first sentence.")
+        let second = session.enqueueStreaming("The second sentence.")
+        var firstCount = 0
+        for try await frame in first {
+            XCTAssertEqual(frame.utteranceIndex, 0)
+            firstCount += frame.samples.count
+        }
+        XCTAssertGreaterThan(firstCount, 0)
+        // Deliberately consume both streams before finish(): sentence completion
+        // must neither wait for another enqueue nor close the voice session.
+        var secondCount = 0
+        for try await frame in second {
+            XCTAssertEqual(frame.utteranceIndex, 1)
+            secondCount += frame.samples.count
+        }
+        XCTAssertGreaterThan(secondCount, 0)
+        session.finish()
+        let refused = session.enqueueStreaming("Already finished.")
+        do {
+            for try await _ in refused { XCTFail("Finished session accepted audio") }
+            XCTFail("Expected cancellation for enqueue after finish")
+        } catch is CancellationError { }
+        await session.cancel()
+    }
+
 }
